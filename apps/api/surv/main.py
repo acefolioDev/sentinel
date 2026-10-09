@@ -14,11 +14,14 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from PIL import Image, ImageOps, UnidentifiedImageError
+from psycopg.types.json import Jsonb
 from .config import ADMIN_TOKEN, DATA_DIR, EMBEDDING_DIMENSIONS, MAX_UPLOAD_BYTES, MODEL_ID, QA_MODEL_ID
 from .db import audit, connect, init_db, row, rows, transaction
 from .worker import probe, start_job, now
 from .vision import configured, encode_images, encode_text, encode_hybrid
-from .qa import answer_video, validated_observations
+from .qa import answer_video, validated_observations, is_count_question
+from .localization import localize_clip
+from .detector import MODEL_ID as DETECTOR_MODEL_ID
 from .reports import build_report
 
 Image.MAX_IMAGE_PIXELS = 30_000_000
@@ -360,37 +363,47 @@ async def ask_video(video_id: str = Form(...), question: str = Form(...),
     try:
         answer=await asyncio.to_thread(answer_video,DATA_DIR/video['storage_key'],question,video['duration_ms'],cropped,subject_type if cropped else None)
     except Exception as exc:
-        raise HTTPException(502,f'Gemini video analysis failed: {type(exc).__name__}') from exc
+        provider='Local tracking' if is_count_question(question) else 'Gemini video analysis'
+        raise HTTPException(502,f'{provider} failed: {type(exc).__name__}') from exc
     intervals=validated_observations(answer,video['duration_ms'])
     status=answer.answer_status
     summary=answer.answer
     count=answer.count
-    limitations=('Gemini observations and timestamps are provisional; review each source clip. '+answer.limitations).strip()
-    import re
-    counting_question=bool(re.search(r'\b(how many|number of|count|kitne|kitni|ginti)\b|कितने|कितनी',question,re.IGNORECASE))
+    limitations=(('Local detector boxes and track associations are provisional; review each source clip. '
+                  if answer._count_method=='local-tracker' else
+                  'Gemini observations and timestamps are provisional; review each source clip. ')+answer.limitations).strip()
+    counting_question=is_count_question(question)
     if counting_question:
         if count is None or (count > 0 and count != len(intervals)) or (count == 0 and intervals) or any(end-start > 12000 for _,_,_,start,end in intervals):
             status='inconclusive'
             count=None
-            summary='A reliable count could not be linked to one valid source interval per observed passage. Review the listed clips and original video.'
-            limitations=(limitations+' Automated counting has not been independently verified.').strip()
+            if answer.count is not None:
+                summary='A reliable count could not be linked to one valid source interval per observed passage. Review the listed clips and original video.'
+            limitations=(limitations+' Counting requires human review.').strip()
         elif count > 0:
             status='possible'
-            summary=f'Gemini estimates {count} distinct passage(s). Each listed time is a model observation; inspect every linked clip before relying on this count.'
-            limitations=(limitations+' This is a model estimate, not a tracker-verified count.').strip()
+            summary=(f'Tracked frame boxes suggest {count} distinct crossing(s) of the inferred video centre line. '
+                     'Inspect every linked clip before relying on this count.' if answer._count_method=='local-tracker' and answer._count_kind=='passage' else
+                     f'Tracked frame boxes suggest {count} visible object track(s). Occlusion or re-entry can split one subject into multiple tracks; inspect the clips.'
+                     if answer._count_method=='local-tracker' else
+                     f'Gemini estimates {count} distinct event(s). Inspect every linked clip before relying on this count.')
+            limitations=(limitations+' This remains an estimate, not a verified ground-truth count.').strip()
         else:
             status='not_found'
-            summary='Gemini did not observe a completed passage matching the question in this video.'
+            summary=(('No completed crossing of the inferred centre line was tracked in sampled frames.'
+                      if answer._count_kind=='passage' else 'No relevant object track was detected in sampled frames.')
+                     if answer._count_method=='local-tracker' else
+                     'Gemini did not observe a completed passage matching the question in this video.')
     else:
         count=None
-    if cropped is not None and status in {'supported','possible'}:
+    if cropped is not None and answer._count_method!='local-tracker' and status in {'supported','possible'}:
         status='possible'
         times=', '.join(f'{start//60000:02d}:{start//1000%60:02d}–{end//60000:02d}:{end//1000%60:02d}'
                         for _,_,_,start,end in intervals)
         summary=(f'A visually similar {subject_type} may appear at {times} (video-relative). '
                  'The reference image does not establish exact identity.') if times else summary
         limitations=(limitations+' Visual similarity alone cannot verify an exact identity.').strip()
-    elif cropped is not None and status=='not_found':
+    elif cropped is not None and answer._count_method!='local-tracker' and status=='not_found':
         summary=f'Gemini did not observe a visually similar {subject_type} in this video. This does not prove absence.'
     if status in {'supported','possible'} and not intervals:
         status='inconclusive'
@@ -404,14 +417,22 @@ async def ask_video(video_id: str = Form(...), question: str = Form(...),
             ref_id=_store_reference(file,subject_type,image,cropped,user)
         with transaction() as db:
             db.execute('INSERT INTO searches(id,kind,query,reference_id,owner_actor,video_id,status,summary,limitations,answer_count,answer_model,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                       (search_id,'qa',question,ref_id,user['actor'],video_id,status,summary,limitations,count,QA_MODEL_ID,now()))
+                       (search_id,'qa',question,ref_id,user['actor'],video_id,status,summary,limitations,count,
+                        DETECTOR_MODEL_ID if answer._count_method=='local-tracker' else QA_MODEL_ID,now()))
             for start_ms,end_ms,description,observed_start_ms,observed_end_ms in intervals:
                 frame=db.execute('SELECT id FROM frames WHERE video_id=? ORDER BY ABS(pts_ms-?) LIMIT 1',
                                  (video_id,(start_ms+end_ms)//2)).fetchone()
                 if not frame:
                     continue
+                match_id=uuid.uuid4().hex
                 db.execute('INSERT INTO matches(id,search_id,frame_id,video_id,camera_id,start_ms,end_ms,similarity_raw,observation,observed_start_ms,observed_end_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                           (uuid.uuid4().hex,search_id,frame['id'],video_id,video['camera_id'],start_ms,end_ms,0.0,description,observed_start_ms,observed_end_ms,now()))
+                           (match_id,search_id,frame['id'],video_id,video['camera_id'],start_ms,end_ms,0.0,description,observed_start_ms,observed_end_ms,now()))
+                if answer._tracking_frames:
+                    sampled=[f for f in answer._tracking_frames if start_ms <= f['pts_ms'] <= end_ms]
+                    db.execute('INSERT INTO match_detections(match_id,payload,created_at) VALUES(?,?,?)',
+                               (match_id,Jsonb({'frames':sampled,'sample_interval_ms':answer._tracking_interval_ms,
+                                                'model_id':DETECTOR_MODEL_ID,
+                                                'note':'Local class boxes and short-gap tracks are approximate.'}),now()))
     except Exception:
         if ref_id:
             with transaction() as db:
@@ -480,7 +501,7 @@ def search_detail(search_id: str, user=Depends(auth)):
             'limitations':search['limitations'],'matches':matches}
 
 def _match(match_id,user):
-    match=row('''SELECT m.*,s.owner_actor,s.kind,s.query,s.status AS answer_status,s.answer_model,f.thumbnail_key,f.model_id,v.storage_key,v.duration_ms,v.sha256,v.source_started_at_utc,
+    match=row('''SELECT m.*,s.owner_actor,s.kind,s.query,s.reference_id,s.status AS answer_status,s.answer_model,f.pts_ms,f.thumbnail_key,f.model_id,v.storage_key,v.duration_ms,v.sha256,v.source_started_at_utc,
                        c.name AS camera_name,c.location FROM matches m JOIN frames f ON f.id=m.frame_id
                        JOIN searches s ON s.id=m.search_id JOIN videos v ON v.id=m.video_id
                        JOIN cameras c ON c.id=m.camera_id WHERE m.id=?''',(match_id,))
@@ -489,6 +510,32 @@ def _match(match_id,user):
     if match['owner_actor'] != user['actor'] and user['role'] != 'admin':
         raise HTTPException(404,'Evidence not found')
     return match
+
+@app.get('/api/v1/evidence/{match_id}/detections')
+async def evidence_detections(match_id: str, user=Depends(auth)):
+    """Locate query objects in sampled clip frames; cache only validated boxes."""
+    item=_match(match_id,user)
+    cached=row('SELECT payload FROM match_detections WHERE match_id=?',(match_id,))
+    if cached:
+        return cached['payload']
+    reference=None
+    if item['reference_id']:
+        ref=row('SELECT crop_key,subject_type FROM reference_images WHERE id=?',(item['reference_id'],))
+        if ref:
+            with Image.open(DATA_DIR/ref['crop_key']) as image:
+                reference=image.convert('RGB')
+    try:
+        target=(' '.join(filter(None,[(ref['subject_type'] if ref else None),item['query']]))
+                if reference is not None else item['query'] or item['kind'])
+        payload=await asyncio.to_thread(localize_clip,DATA_DIR/item['storage_key'],item['start_ms'],
+                                        item['end_ms'],item['pts_ms'],target,reference)
+    except Exception as exc:
+        raise HTTPException(502,f'Object localization failed: {type(exc).__name__}') from exc
+    with transaction() as db:
+        db.execute('INSERT INTO match_detections(match_id,payload,created_at) VALUES(?,?,?) ON CONFLICT(match_id) DO NOTHING',
+                   (match_id,Jsonb(payload),now()))
+    audit('evidence.detect',match_id,actor=user['actor'])
+    return payload
 
 @app.get('/api/v1/evidence/{match_id}/keyframe')
 def keyframe(match_id: str, user=Depends(auth)):

@@ -47,6 +47,9 @@ f"""CREATE TABLE IF NOT EXISTS frames (
 "ALTER TABLE matches ADD COLUMN IF NOT EXISTS observed_start_ms INTEGER",
 "ALTER TABLE matches ADD COLUMN IF NOT EXISTS observed_end_ms INTEGER",
 "CREATE INDEX IF NOT EXISTS ix_matches_search ON matches(search_id)",
+"""CREATE TABLE IF NOT EXISTS match_detections (
+ match_id TEXT PRIMARY KEY REFERENCES matches(id) ON DELETE CASCADE,
+ payload JSONB NOT NULL, created_at TEXT NOT NULL)""",
 "UPDATE searches s SET video_id=(SELECT m.video_id FROM matches m WHERE m.search_id=s.id LIMIT 1) WHERE s.kind='qa' AND s.video_id IS NULL",
 """CREATE TABLE IF NOT EXISTS reports (
  id TEXT PRIMARY KEY, title TEXT NOT NULL, notes TEXT NOT NULL, storage_key TEXT NOT NULL,

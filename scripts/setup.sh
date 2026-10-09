@@ -19,5 +19,6 @@ fi
 psql -d surveillance_qa -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS vector' >/dev/null
 "$PYTHON_BIN" -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/python scripts/download_detector.py
 npm --prefix apps/web install
 printf 'Setup complete. Add GEMINI_API_KEY to .env, then run ./scripts/dev.sh\n'

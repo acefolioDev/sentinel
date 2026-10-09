@@ -11,3 +11,7 @@ pgvector>=0.4,<1
 google-genai>=1.0,<2
 cryptography>=38,<49
 python-dotenv>=1,<2
+torch>=2.2,<3
+transformers>=4.49,<5
+huggingface-hub>=0.29,<2
+safetensors>=0.4,<1

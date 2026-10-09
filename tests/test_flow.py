@@ -71,6 +71,17 @@ def test_full_investigation_flow(tmp_path,monkeypatch):
         assert client.get(match['thumbnail_url'],headers=HEADERS).status_code==200
         clip=client.get(match['clip_url'],headers=HEADERS)
         assert clip.status_code==200 and len(clip.content)>100
+        localization_calls=[]
+        def fake_localization(path,start_ms,end_ms,keyframe_ms,query,reference):
+            localization_calls.append((start_ms,end_ms,query))
+            return {'frames':[{'pts_ms':keyframe_ms,'boxes':[{'x1':.1,'y1':.2,'x2':.6,'y2':.8,
+                                                               'label':'red object','track_id':1}]}],
+                    'sample_interval_ms':1000,'model_id':'test-model'}
+        monkeypatch.setattr(api_module,'localize_clip',fake_localization)
+        detection_path=f'/api/v1/evidence/{match["id"]}/detections'
+        assert client.get(detection_path,headers=HEADERS).json()['frames'][0]['boxes'][0]['label']=='red object'
+        assert client.get(detection_path,headers=HEADERS).status_code==200
+        assert len(localization_calls)==1
         monkeypatch.setattr(api_module,'answer_video',lambda *args,**kwargs:VideoAnswer(
             answer_status='supported',answer='Two people crossed the view near 00:01.',count=2,
             limitations='Count requires human review.',evidence=[
