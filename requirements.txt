@@ -1,0 +1,10 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.9
+av>=19,<20
+imageio-ffmpeg>=0.6,<1
+pillow>=11,<13
+numpy>=1.26,<2
+reportlab>=4,<6
+torch>=2.2,<3
+transformers>=4.44,<4.50
