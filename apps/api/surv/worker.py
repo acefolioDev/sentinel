@@ -1,10 +1,10 @@
-import json
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 import av
+import numpy as np
 from PIL import Image
 from .config import DATA_DIR, FRAME_INTERVAL_SEC, MAX_VIDEO_SECONDS, MODEL_ID
 from .db import row, transaction
@@ -103,7 +103,7 @@ def _save_batch(batch, video_id):
             preview.thumbnail((640, 360), Image.Resampling.LANCZOS)
             preview.save(DATA_DIR / thumb_rel, 'JPEG', quality=82)
             db.execute('INSERT INTO frames(id,video_id,pts_ms,thumbnail_key,embedding,model_id,width,height) VALUES(?,?,?,?,?,?,?,?)',
-                       (frame_id,video_id,pts,thumb_rel,json.dumps(vector),MODEL_ID,image.width,image.height))
+                       (frame_id,video_id,pts,thumb_rel,np.asarray(vector,dtype=np.float32),MODEL_ID,image.width,image.height))
     return len(batch)
 
 def _progress(job_id, count, total, started):

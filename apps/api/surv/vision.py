@@ -1,52 +1,69 @@
-"""Shared CLIP image/text space. Raw cosine scores are retrieval ranks, not confidence."""
-import threading
-import os
-import numpy as np
+"""Gemini Embedding 2: text, images, and combined queries share one vector space."""
+import io
+import math
 from PIL import Image
-from .config import MODEL_ID
+from google import genai
+from google.genai import types
+from .config import EMBEDDING_DIMENSIONS, GEMINI_API_KEY, MODEL_ID
 
-_lock = threading.Lock()
-_model = None
-_processor = None
-_torch = None
+_client = None
 
-def _load():
-    global _model, _processor, _torch
-    if _model is None:
-        with _lock:
-            if _model is None:
-                os.environ.setdefault('HF_HUB_DISABLE_XET', '1')
-                import torch
-                from transformers import CLIPModel, CLIPProcessor
-                _processor = CLIPProcessor.from_pretrained(MODEL_ID)
-                _model = CLIPModel.from_pretrained(MODEL_ID).eval()
-                _torch = torch
-    return _model, _processor, _torch
+class ProviderNotConfigured(RuntimeError):
+    pass
+
+def configured():
+    return bool(GEMINI_API_KEY)
+
+def _client_instance():
+    global _client
+    if not GEMINI_API_KEY:
+        raise ProviderNotConfigured('Set GEMINI_API_KEY in .env to enable Gemini indexing and search')
+    if _client is None:
+        _client = genai.Client(api_key=GEMINI_API_KEY)
+    return _client
+
+def _image_part(image: Image.Image):
+    buffer = io.BytesIO()
+    image.convert('RGB').save(buffer, format='JPEG', quality=85)
+    return types.Part.from_bytes(data=buffer.getvalue(), mime_type='image/jpeg')
+
+def _vectors(response, expected):
+    embeddings = response.embeddings or []
+    if len(embeddings) != expected:
+        raise RuntimeError(f'Gemini returned {len(embeddings)} embeddings; expected {expected}')
+    result = []
+    for item in embeddings:
+        values = item.values or []
+        if len(values) != EMBEDDING_DIMENSIONS or not all(math.isfinite(x) for x in values):
+            raise RuntimeError('Gemini returned an invalid embedding')
+        result.append([float(x) for x in values])
+    return result
 
 def encode_images(images: list[Image.Image]) -> list[list[float]]:
-    model, processor, torch = _load()
-    values = processor(images=[im.convert('RGB') for im in images], return_tensors='pt')
-    with torch.no_grad():
-        vectors = model.get_image_features(pixel_values=values['pixel_values'])
-        if not isinstance(vectors, torch.Tensor):
-            vectors = vectors.pooler_output
-        vectors = torch.nn.functional.normalize(vectors, dim=-1)
-    return vectors.cpu().numpy().astype('float32').tolist()
-
-def encode_text(text: str) -> list[float]:
-    model, processor, torch = _load()
-    values = processor(text=[text], return_tensors='pt', padding=True, truncation=True)
-    with torch.no_grad():
-        vectors = model.get_text_features(input_ids=values['input_ids'], attention_mask=values['attention_mask'])
-        if not isinstance(vectors, torch.Tensor):
-            vectors = vectors.pooler_output
-        vectors = torch.nn.functional.normalize(vectors, dim=-1)
-    return vectors[0].cpu().numpy().astype('float32').tolist()
-
-def rank(query: list[float], candidates: list[dict], limit: int) -> list[tuple[float,dict]]:
-    if not candidates:
+    if not images:
         return []
-    matrix = np.asarray([c['embedding'] for c in candidates], dtype=np.float32)
-    scores = matrix @ np.asarray(query, dtype=np.float32)
-    order = np.argsort(-scores)[:limit]
-    return [(float(scores[i]), candidates[int(i)]) for i in order]
+    client = _client_instance()
+    vectors = []
+    # Gemini Embedding 2 allows up to six images per request. Content wrappers
+    # request separate embeddings rather than one aggregated embedding.
+    for start in range(0, len(images), 6):
+        chunk = images[start:start+6]
+        contents = [types.Content(parts=[_image_part(image)]) for image in chunk]
+        response = client.models.embed_content(
+            model=MODEL_ID, contents=contents,
+            config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSIONS))
+        vectors.extend(_vectors(response, len(chunk)))
+    return vectors
+
+def encode_text(query: str) -> list[float]:
+    response = _client_instance().models.embed_content(
+        model=MODEL_ID, contents=f'task: search result | query: {query}',
+        config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSIONS))
+    return _vectors(response, 1)[0]
+
+def encode_hybrid(image: Image.Image, query: str) -> list[float]:
+    # The SDK aggregates text and image parts in one multimodal embedding.
+    response = _client_instance().models.embed_content(
+        model=MODEL_ID, contents=[query, _image_part(image)],
+        config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSIONS))
+    return _vectors(response, 1)[0]

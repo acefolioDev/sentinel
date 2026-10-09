@@ -31,9 +31,18 @@ def build_report(path: Path, title: str, notes: str, evidence: list[dict]):
         data = [
             ['Evidence ID', item['id']], ['Source video', item['video_id']],
             ['Source SHA-256', item['sha256']], ['Source interval', f'{item["start_ms"] / 1000:.3f}–{item["end_ms"] / 1000:.3f} seconds'],
-            ['Source UTC', item.get('source_utc') or 'Unknown (video offset only)'],
-            ['Review state', item['review_status']], ['Raw similarity', f'{item["similarity_raw"]:.4f} (uncalibrated)'],
-            ['Reviewer note', item.get('review_note') or 'None']]
+            ['Source UTC', item.get('source_utc') or 'Unknown (video offset only)']]
+        if item['kind'] == 'qa':
+            data.extend([
+                ['Question', item.get('query') or 'None'],
+                ['Answer status', item.get('answer_status') or 'Unknown'],
+                ['Model observation', item.get('observation') or 'None'],
+                ['Observed offset', f'{item["observed_start_ms"] / 1000:.3f}–{item["observed_end_ms"] / 1000:.3f} seconds'],
+                ['Video Q&A model', item.get('answer_model') or 'Unknown']])
+        else:
+            data.extend([['Embedding model', item['model_id']],
+                         ['Raw similarity', f'{item["similarity_raw"]:.4f} (uncalibrated)']])
+        data.extend([['Review state', item['review_status']], ['Reviewer note', item.get('review_note') or 'None']])
         table = Table([[Paragraph(_safe(str(a)), styles['SmallMuted']), Paragraph(_safe(str(b)), styles['BodyText'])] for a,b in data],
                       colWidths=[105, 390])
         table.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),6),

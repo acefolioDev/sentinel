@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import io
 import json
@@ -8,16 +9,16 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
-import numpy as np
 from fastapi import FastAPI, Depends, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from PIL import Image, UnidentifiedImageError
-from .config import ADMIN_TOKEN, DATA_DIR, MAX_UPLOAD_BYTES, MODEL_ID
+from PIL import Image, ImageOps, UnidentifiedImageError
+from .config import ADMIN_TOKEN, DATA_DIR, EMBEDDING_DIMENSIONS, MAX_UPLOAD_BYTES, MODEL_ID, QA_MODEL_ID
 from .db import audit, connect, init_db, row, rows, transaction
 from .worker import probe, start_job, now
-from .vision import encode_images, encode_text, rank
+from .vision import configured, encode_images, encode_text, encode_hybrid
+from .qa import answer_video, validated_observations
 from .reports import build_report
 
 Image.MAX_IMAGE_PIXELS = 30_000_000
@@ -92,7 +93,8 @@ class ReportInput(BaseModel):
 
 @app.get('/api/v1/health')
 def health():
-    return {'ok': True, 'model_id': MODEL_ID}
+    return {'ok': True, 'model_id': MODEL_ID, 'qa_model_id': QA_MODEL_ID,
+            'ai_provider': 'Gemini', 'provider_configured': configured()}
 
 @app.get('/api/v1/me')
 def me(user=Depends(auth)):
@@ -106,7 +108,8 @@ def overview(user=Depends(auth)):
     jobs = [j for j in rows('SELECT * FROM jobs ORDER BY created_at DESC LIMIT 30') if any(v['id']==j['video_id'] for v in videos)]
     return {'camera_count': len([c for c in rows('SELECT id FROM cameras') if visible is None or c['id'] in visible]),
             'video_count': len(videos), 'ready_count': sum(v['status']=='ready' for v in videos),
-            'frame_count': sum(v['frame_count'] for v in videos), 'recent_videos': videos[:6], 'jobs': jobs[:8]}
+            'frame_count': sum(v['frame_count'] for v in videos), 'recent_videos': videos[:6], 'jobs': jobs[:8],
+            'provider_configured': configured()}
 
 @app.get('/api/v1/cameras')
 def cameras(user=Depends(auth)):
@@ -130,6 +133,7 @@ def videos(user=Depends(auth)):
 
 @app.post('/api/v1/videos')
 async def upload_video(file: UploadFile = File(...), camera_id: str = Form(...), source_started_at_utc: str | None = Form(None), user=Depends(auth)):
+    _require_provider()
     allowed(user,camera_id)
     if not row('SELECT id FROM cameras WHERE id=?',(camera_id,)):
         raise HTTPException(404,'Camera not found')
@@ -197,39 +201,60 @@ def retry_job(job_id: str, user=Depends(auth)):
     audit('job.retry',job_id,actor=user['actor'])
     return {'status':'queued'}
 
-def _candidate_frames(user, camera_ids, start_time, end_time):
+def _require_provider():
+    if not configured():
+        raise HTTPException(503, 'Set GEMINI_API_KEY in .env before indexing or searching')
+
+def _ranked_frames(vector, user, camera_ids, start_time, end_time, limit):
     if (start_time and start_time.tzinfo is None) or (end_time and end_time.tzinfo is None):
         raise HTTPException(422, 'Time filters must include a timezone')
     if start_time and end_time and start_time > end_time:
         raise HTTPException(422, 'Start time must be before end time')
+    if len(vector) != EMBEDDING_DIMENSIONS:
+        raise HTTPException(500, 'Embedding dimension does not match the pgvector index')
     scope = _camera_filter(user,camera_ids)
-    results=[]
-    for frame in rows("SELECT f.*,v.camera_id,v.duration_ms,v.source_started_at_utc,v.status FROM frames f JOIN videos v ON v.id=f.video_id WHERE v.status='ready' AND f.model_id=?",(MODEL_ID,)):
-        if scope is not None and frame['camera_id'] not in scope: continue
-        if start_time or end_time:
-            stamp = _utc_for(frame,frame['pts_ms'])
-            if not stamp: continue
-            instant=datetime.fromisoformat(stamp)
-            if start_time and instant < start_time: continue
-            if end_time and instant > end_time: continue
-        frame['embedding']=json.loads(frame['embedding'])
-        results.append(frame)
-    return results
+    import numpy as np
+    query_vector = np.asarray(vector, dtype=np.float32)
+    conditions = ["v.status='ready'", 'f.model_id=?']
+    filters = [MODEL_ID]
+    if scope is not None:
+        if not scope:
+            return []
+        conditions.append('v.camera_id = ANY(?)')
+        filters.append(sorted(scope))
+    stamp = "(v.source_started_at_utc::timestamptz + (f.pts_ms + c.clock_offset_ms) * interval '1 millisecond')"
+    if start_time or end_time:
+        conditions.append('v.source_started_at_utc IS NOT NULL')
+    if start_time:
+        conditions.append(stamp+' >= ?')
+        filters.append(start_time)
+    if end_time:
+        conditions.append(stamp+' <= ?')
+        filters.append(end_time)
+    sql = f'''SELECT f.id, f.video_id, f.pts_ms, v.camera_id, v.duration_ms,
+                     1 - (f.embedding <=> ?) AS similarity_raw
+              FROM frames f JOIN videos v ON v.id=f.video_id
+              JOIN cameras c ON c.id=v.camera_id
+              WHERE {' AND '.join(conditions)}
+              ORDER BY f.embedding <=> ? LIMIT ?'''
+    with connect() as db:
+        # Continue an HNSW scan past filtered-out camera/time rows when needed.
+        db.execute('SET LOCAL hnsw.iterative_scan = strict_order')
+        return list(db.execute(sql, [query_vector, *filters, query_vector, limit]).fetchall())
 
 def _create_search(kind, query, reference_id, vector, user, camera_ids, start_time, end_time, top_k):
-    frames = _candidate_frames(user,camera_ids,start_time,end_time)
-    ranked = rank(vector,frames,min(len(frames),top_k*8))
+    ranked = _ranked_frames(vector,user,camera_ids,start_time,end_time,top_k*8)
     selected=[]
-    for score, frame in ranked:
+    for frame in ranked:
         if any(item['video_id']==frame['video_id'] and abs(item['pts_ms']-frame['pts_ms']) < 6000 for _,item in selected):
             continue
-        selected.append((score,frame))
+        selected.append((float(frame['similarity_raw']),frame))
         if len(selected)>=top_k: break
     search_id=uuid.uuid4().hex
     status='possible' if selected else 'not_found'
     summary=(f'{len(selected)} candidate window(s) found. Inspect source footage before drawing conclusions.' if selected else
              'No candidate was found in the selected indexed footage.')
-    limitations=('Raw CLIP cosine similarity is uncalibrated. Sampled frames may miss short events; visual resemblance does not establish identity or action.' if selected else
+    limitations=('Raw Gemini embedding cosine similarity is uncalibrated. Sampled frames may miss short events; visual resemblance does not establish identity or action.' if selected else
                  'No result may reflect visibility, sampling, selected cameras, time filters, or incomplete indexing.')
     with transaction() as db:
         db.execute('INSERT INTO searches(id,kind,query,reference_id,owner_actor,status,summary,limitations,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
@@ -247,6 +272,7 @@ def search_text(body: SearchInput, user=Depends(auth)):
     if _is_temporal_question(body.query):
         return {'search_id':None,'answer_status':'inconclusive','summary':'This question needs ordered video observations. Frame similarity cannot establish the event or sequence.',
                 'limitations':'Review the source video manually. Temporal event models are not enabled in this MVP.','matches':[]}
+    _require_provider()
     vector=encode_text(body.query)
     return _create_search('text',body.query,None,vector,user,body.camera_ids,body.start_time,body.end_time,body.top_k)
 
@@ -254,7 +280,7 @@ def _is_temporal_question(query):
     import re
     return bool(re.search(r'\b(fell|falling|abandoned|left behind|before|after|how long|remained|dwell|opened|closed)\b',query.lower()))
 
-async def _image_search(file, subject_type, crop, query, camera_ids, start_time, end_time, top_k, user):
+async def _read_reference(file, subject_type, crop):
     if subject_type not in {'person','vehicle','object'}:
         raise HTTPException(422,'Choose person, vehicle, or object')
     data=await file.read(15*1024*1024+1)
@@ -262,7 +288,7 @@ async def _image_search(file, subject_type, crop, query, camera_ids, start_time,
     try:
         image=Image.open(io.BytesIO(data))
         image.verify()
-        image=Image.open(io.BytesIO(data)).convert('RGB')
+        image=ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert('RGB')
     except (UnidentifiedImageError,ValueError,OSError):
         raise HTTPException(415,'Unsupported image')
     try:
@@ -273,32 +299,128 @@ async def _image_search(file, subject_type, crop, query, camera_ids, start_time,
         raise HTTPException(422,'Crop must be normalized [x1,y1,x2,y2]')
     cropped=image.crop((int(x1*image.width),int(y1*image.height),int(x2*image.width),int(y2*image.height)))
     if min(cropped.size)<16: raise HTTPException(422,'Selected subject is too small')
+    return image, cropped
+
+def _store_reference(file, subject_type, image, cropped, user):
     ref_id=uuid.uuid4().hex
     original_rel=f'references/{ref_id}.jpg'
     crop_rel=f'references/{ref_id}-crop.jpg'
-    image.save(DATA_DIR/original_rel,'JPEG',quality=90)
-    cropped.save(DATA_DIR/crop_rel,'JPEG',quality=90)
     try:
-        image_vector=np.asarray(encode_images([cropped])[0],dtype=np.float32)
-        vector=image_vector
-        kind='image'
-        if query:
-            text_vector=np.asarray(encode_text(query),dtype=np.float32)
-            vector=(image_vector + text_vector)/2
-            vector=vector/np.linalg.norm(vector)
-            kind='hybrid'
+        image.save(DATA_DIR/original_rel,'JPEG',quality=90)
+        cropped.save(DATA_DIR/crop_rel,'JPEG',quality=90)
         with transaction() as db:
             db.execute('INSERT INTO reference_images(id,filename,storage_key,crop_key,subject_type,owner_actor,created_at) VALUES(?,?,?,?,?,?,?)',
                        (ref_id,Path(file.filename or 'reference.jpg').name,original_rel,crop_rel,subject_type,user['actor'],now()))
-        result=_create_search(kind,query,ref_id,vector.tolist(),user,camera_ids,start_time,end_time,top_k)
-        result['reference_id']=ref_id
-        return result
     except Exception:
-        with transaction() as db:
-            db.execute('DELETE FROM reference_images WHERE id=?',(ref_id,))
         (DATA_DIR/original_rel).unlink(missing_ok=True)
         (DATA_DIR/crop_rel).unlink(missing_ok=True)
         raise
+    return ref_id
+
+async def _image_search(file, subject_type, crop, query, camera_ids, start_time, end_time, top_k, user):
+    _require_provider()
+    image, cropped = await _read_reference(file, subject_type, crop)
+    ref_id = None
+    try:
+        vector=encode_images([cropped])[0]
+        kind='image'
+        if query:
+            vector=encode_hybrid(cropped,query)
+            kind='hybrid'
+        ref_id=_store_reference(file,subject_type,image,cropped,user)
+        result=_create_search(kind,query,ref_id,vector,user,camera_ids,start_time,end_time,top_k)
+        result['reference_id']=ref_id
+        return result
+    except Exception:
+        if ref_id:
+            with transaction() as db:
+                db.execute('DELETE FROM reference_images WHERE id=?',(ref_id,))
+            (DATA_DIR/f'references/{ref_id}.jpg').unlink(missing_ok=True)
+            (DATA_DIR/f'references/{ref_id}-crop.jpg').unlink(missing_ok=True)
+        raise
+
+@app.post('/api/v1/qa')
+async def ask_video(video_id: str = Form(...), question: str = Form(...),
+                    file: UploadFile | None = File(None), subject_type: str = Form('object'),
+                    crop: str | None = Form(None), user=Depends(auth)):
+    """Answer a question about one authorized original video and link valid intervals."""
+    _require_provider()
+    question=question.strip()
+    if not 2 <= len(question) <= 500:
+        raise HTTPException(422,'Question must be 2–500 characters')
+    video=row('SELECT * FROM videos WHERE id=?',(video_id,))
+    if not video:
+        raise HTTPException(404,'Video not found')
+    allowed(user,video['camera_id'])
+    if video['status'] != 'ready':
+        raise HTTPException(409,'Video must finish indexing before Q&A')
+    image=cropped=None
+    if file is not None:
+        image,cropped=await _read_reference(file,subject_type,crop)
+    try:
+        answer=await asyncio.to_thread(answer_video,DATA_DIR/video['storage_key'],question,video['duration_ms'],cropped,subject_type if cropped else None)
+    except Exception as exc:
+        raise HTTPException(502,f'Gemini video analysis failed: {type(exc).__name__}') from exc
+    intervals=validated_observations(answer,video['duration_ms'])
+    status=answer.answer_status
+    summary=answer.answer
+    count=answer.count
+    limitations=('Gemini observations and timestamps are provisional; review each source clip. '+answer.limitations).strip()
+    import re
+    counting_question=bool(re.search(r'\b(how many|number of|count|kitne|kitni|ginti)\b|कितने|कितनी',question,re.IGNORECASE))
+    if counting_question:
+        if count is None or (count > 0 and count != len(intervals)) or (count == 0 and intervals) or any(end-start > 12000 for _,_,_,start,end in intervals):
+            status='inconclusive'
+            count=None
+            summary='A reliable count could not be linked to one valid source interval per observed passage. Review the listed clips and original video.'
+            limitations=(limitations+' Automated counting has not been independently verified.').strip()
+        elif count > 0:
+            status='possible'
+            summary=f'Gemini estimates {count} distinct passage(s). Each listed time is a model observation; inspect every linked clip before relying on this count.'
+            limitations=(limitations+' This is a model estimate, not a tracker-verified count.').strip()
+        else:
+            status='not_found'
+            summary='Gemini did not observe a completed passage matching the question in this video.'
+    else:
+        count=None
+    if cropped is not None and status in {'supported','possible'}:
+        status='possible'
+        times=', '.join(f'{start//60000:02d}:{start//1000%60:02d}–{end//60000:02d}:{end//1000%60:02d}'
+                        for _,_,_,start,end in intervals)
+        summary=(f'A visually similar {subject_type} may appear at {times} (video-relative). '
+                 'The reference image does not establish exact identity.') if times else summary
+        limitations=(limitations+' Visual similarity alone cannot verify an exact identity.').strip()
+    elif cropped is not None and status=='not_found':
+        summary=f'Gemini did not observe a visually similar {subject_type} in this video. This does not prove absence.'
+    if status in {'supported','possible'} and not intervals:
+        status='inconclusive'
+        summary='Gemini returned an answer, but no valid source-video interval could be linked to it.'
+        limitations=(limitations+' Review the original video manually.').strip()
+        count=None
+    ref_id=None
+    search_id=uuid.uuid4().hex
+    try:
+        if cropped is not None:
+            ref_id=_store_reference(file,subject_type,image,cropped,user)
+        with transaction() as db:
+            db.execute('INSERT INTO searches(id,kind,query,reference_id,owner_actor,video_id,status,summary,limitations,answer_count,answer_model,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                       (search_id,'qa',question,ref_id,user['actor'],video_id,status,summary,limitations,count,QA_MODEL_ID,now()))
+            for start_ms,end_ms,description,observed_start_ms,observed_end_ms in intervals:
+                frame=db.execute('SELECT id FROM frames WHERE video_id=? ORDER BY ABS(pts_ms-?) LIMIT 1',
+                                 (video_id,(start_ms+end_ms)//2)).fetchone()
+                if not frame:
+                    continue
+                db.execute('INSERT INTO matches(id,search_id,frame_id,video_id,camera_id,start_ms,end_ms,similarity_raw,observation,observed_start_ms,observed_end_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                           (uuid.uuid4().hex,search_id,frame['id'],video_id,video['camera_id'],start_ms,end_ms,0.0,description,observed_start_ms,observed_end_ms,now()))
+    except Exception:
+        if ref_id:
+            with transaction() as db:
+                db.execute('DELETE FROM reference_images WHERE id=?',(ref_id,))
+            (DATA_DIR/f'references/{ref_id}.jpg').unlink(missing_ok=True)
+            (DATA_DIR/f'references/{ref_id}-crop.jpg').unlink(missing_ok=True)
+        raise
+    audit('search.qa',search_id,details=json.dumps({'video_id':video_id,'evidence_intervals':len(intervals)}),actor=user['actor'])
+    return search_detail(search_id,user)
 
 @app.post('/api/v1/search/image')
 async def search_image(file: UploadFile = File(...), subject_type: str = Form('object'), crop: str | None = Form(None),
@@ -336,22 +458,29 @@ def search_detail(search_id: str, user=Depends(auth)):
     if not search: raise HTTPException(404,'Search not found')
     if search['owner_actor'] != user['actor'] and user['role'] != 'admin':
         raise HTTPException(404,'Search not found')
+    if search['kind']=='qa':
+        video=row('SELECT camera_id FROM videos WHERE id=?',(search['video_id'],))
+        if not video:
+            raise HTTPException(404,'Search not found')
+        allowed(user,video['camera_id'])
     matches=[]
     for item in rows('''SELECT m.*,f.pts_ms,f.thumbnail_key,v.filename,v.sha256,v.source_started_at_utc,
                                c.name AS camera_name,c.location
                         FROM matches m JOIN frames f ON f.id=m.frame_id JOIN videos v ON v.id=m.video_id
                         JOIN cameras c ON c.id=m.camera_id WHERE m.search_id=? ORDER BY m.similarity_raw DESC''',(search_id,)):
         if user['camera_ids'] is not None and item['camera_id'] not in user['camera_ids']: continue
-        item['source_utc']=_utc_for(item,item['start_ms'])
+        item['source_utc']=_utc_for(item,item['observed_start_ms'] if item['observed_start_ms'] is not None else item['start_ms'])
         item['thumbnail_url']=f'/api/v1/evidence/{item["id"]}/keyframe'
         item['clip_url']=f'/api/v1/evidence/{item["id"]}/clip'
         matches.append(item)
     return {'search_id':search_id,'kind':search['kind'],'query':search['query'],'reference_id':search['reference_id'],
-            'answer_status':search['status'] if matches else 'not_found','summary':search['summary'] if matches else 'No authorized candidates available.',
+            'answer_count':search['answer_count'],'answer_model':search['answer_model'],
+            'answer_status':search['status'] if matches or search['kind']=='qa' else 'not_found',
+            'summary':search['summary'] if matches or search['kind']=='qa' else 'No authorized candidates available.',
             'limitations':search['limitations'],'matches':matches}
 
 def _match(match_id,user):
-    match=row('''SELECT m.*,s.owner_actor,f.thumbnail_key,v.storage_key,v.duration_ms,v.sha256,v.source_started_at_utc,
+    match=row('''SELECT m.*,s.owner_actor,s.kind,s.query,s.status AS answer_status,s.answer_model,f.thumbnail_key,f.model_id,v.storage_key,v.duration_ms,v.sha256,v.source_started_at_utc,
                        c.name AS camera_name,c.location FROM matches m JOIN frames f ON f.id=m.frame_id
                        JOIN searches s ON s.id=m.search_id JOIN videos v ON v.id=m.video_id
                        JOIN cameras c ON c.id=m.camera_id WHERE m.id=?''',(match_id,))
@@ -427,7 +556,7 @@ def create_report(body: ReportInput, user=Depends(auth)):
     unique=list(dict.fromkeys(body.evidence_ids))
     evidence=[_match(evidence_id,user) for evidence_id in unique]
     for item in evidence:
-        item['source_utc']=_utc_for(item,item['start_ms'])
+        item['source_utc']=_utc_for(item,item['observed_start_ms'] if item['observed_start_ms'] is not None else item['start_ms'])
     report_id=uuid.uuid4().hex
     rel=f'reports/{report_id}.pdf'
     build_report(DATA_DIR/rel,body.title,body.notes,evidence)

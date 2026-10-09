@@ -1,9 +1,9 @@
 export type Camera = {id:string; name:string; location:string; timezone:string; clock_offset_ms:number}
 export type Video = {id:string; camera_id:string; camera_name:string; location:string; filename:string; status:string; duration_ms:number; frame_count:number; created_at:string; error?:string; sha256:string; source_started_at_utc?:string}
 export type Job = {id:string; video_id:string; stage:string; status:string; processed:number; total:number; elapsed_ms:number; error?:string; created_at:string; updated_at:string}
-export type Match = {id:string; video_id:string; camera_id:string; camera_name:string; location:string; filename:string; start_ms:number; end_ms:number; pts_ms:number; similarity_raw:number; review_status:string; review_note:string; source_utc?:string; thumbnail_url:string; clip_url:string; sha256:string}
-export type SearchResult = {search_id:string|null; kind?:string; query?:string; reference_id?:string; answer_status:string; summary:string; limitations:string; matches:Match[]}
-export type Overview = {camera_count:number; video_count:number; ready_count:number; frame_count:number; recent_videos:Video[]; jobs:Job[]}
+export type Match = {id:string; video_id:string; camera_id:string; camera_name:string; location:string; filename:string; start_ms:number; end_ms:number; observed_start_ms?:number|null; observed_end_ms?:number|null; pts_ms:number; similarity_raw:number; observation?:string; review_status:string; review_note:string; source_utc?:string; thumbnail_url:string; clip_url:string; sha256:string}
+export type SearchResult = {search_id:string|null; kind?:string; query?:string; reference_id?:string; answer_status:string; answer_count?:number|null; answer_model?:string|null; summary:string; limitations:string; matches:Match[]}
+export type Overview = {camera_count:number; video_count:number; ready_count:number; frame_count:number; recent_videos:Video[]; jobs:Job[]; provider_configured:boolean}
 
 export class Api {
   token:string
